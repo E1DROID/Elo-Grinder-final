@@ -1,0 +1,139 @@
+name: Build Elo Grinder APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      # Phone-friendly: if you only uploaded EloGrinder.zip (one file) to the repo root, unpack it here
+      - name: Unpack EloGrinder.zip if present
+        run: |
+          if [ -f EloGrinder.zip ]; then unzip -oq EloGrinder.zip -x '.github/*'; echo "Unpacked EloGrinder.zip"; fi
+          ls -la
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      # Engines only rebuild when this workflow file changes
+      - name: Cache engines
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/jniLibs/arm64-v8a
+          key: engines-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Build Stockfish (game review engine)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          export PATH="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          git clone --depth 1 --branch sf_17 https://github.com/official-stockfish/Stockfish.git
+          cd Stockfish/src
+          make -j"$(nproc)" net
+          make -j"$(nproc)" build ARCH=armv8 COMP=ndk
+          llvm-strip stockfish
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          cp stockfish "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/libstockfish.so"
+
+      - name: Build lc0 (runs the Maia nets)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -ex
+          TC="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          sudo apt-get update -y
+          sudo apt-get install -y ninja-build meson python3-pip
+          meson --version
+          git clone --depth 1 --branch release/0.31 --recurse-submodules https://github.com/LeelaChessZero/lc0.git
+          git clone --depth 1 --branch 3.4.0 https://gitlab.com/libeigen/eigen.git
+          mkdir -p pc
+          printf 'Name: eigen3\nDescription: Eigen\nVersion: 3.4.0\nCflags: -I%s\n' "$PWD/eigen" > pc/eigen3.pc
+          cat > android.cross <<CROSS
+          [binaries]
+          c = '$TC/aarch64-linux-android26-clang'
+          cpp = '$TC/aarch64-linux-android26-clang++'
+          ar = '$TC/llvm-ar'
+          strip = '$TC/llvm-strip'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'armv8'
+          endian = 'little'
+          [built-in options]
+          pkg_config_path = '$PWD/pc'
+          cpp_args = ['-I$PWD/eigen']
+          [properties]
+          needs_exe_wrapper = true
+          CROSS
+          sed -i 's/^ *//' android.cross
+          cd lc0
+          # only pass meson options that exist in this lc0 version
+          OPTS=""
+          add() { if grep -Eq "option\(['\"]$1['\"]" meson_options.txt; then OPTS="$OPTS -D$1=$2"; else echo "skipping unknown option $1"; fi; }
+          for o in gtest opencl cudnn plain_cuda dx mkl openblas dnnl onednn onnx accelerate embed cutlass; do add $o false; done
+          add blas true
+          add eigen true
+          add eigen_include_dir "$PWD/../eigen"
+          meson setup build --cross-file ../android.cross --buildtype release -Db_lto=false $OPTS || { tail -n 120 build/meson-logs/meson-log.txt; exit 1; }
+          ninja -C build lc0
+          "$TC/llvm-strip" build/lc0
+          mkdir -p "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          cp build/lc0 "$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a/liblc0.so"
+
+      - name: Download Maia weights (1100-1900)
+        run: |
+          set -e
+          mkdir -p app/src/main/assets/maia
+          for e in 1100 1200 1300 1400 1500 1600 1700 1800 1900; do
+            curl -fL -o app/src/main/assets/maia/maia-$e.pb.gz \
+              "https://github.com/CSSLab/maia-chess/releases/download/v1.0/maia-$e.pb.gz" \
+            || curl -fL -o app/src/main/assets/maia/maia-$e.pb.gz \
+              "https://raw.githubusercontent.com/CSSLab/maia-chess/master/maia_weights/maia-$e.pb.gz"
+          done
+          ls -la app/src/main/assets/maia
+
+      - name: Fetch chess.js (rules engine, bundled offline)
+        run: |
+          mkdir -p app/src/main/assets/www
+          npm install chess.js@0.10.3 --prefix /tmp/cj
+          cp /tmp/cj/node_modules/chess.js/chess.js app/src/main/assets/www/chess.js
+
+      - name: Verify project files are all uploaded
+        run: |
+          missing=0
+          for f in settings.gradle build.gradle app/build.gradle app/src/main/AndroidManifest.xml \
+                   app/src/main/java/com/elogrinder/MainActivity.java app/src/main/res/drawable/ic_launcher.xml \
+                   app/src/main/assets/www/index.html app/src/main/assets/www/app.js app/src/main/assets/www/review.js \
+                   app/src/main/assets/www/engine.js app/src/main/assets/www/i18n.js app/src/main/assets/www/style.css; do
+            if [ ! -f "$f" ]; then echo "MISSING: $f"; missing=1; fi
+          done
+          if [ "$missing" = 1 ]; then echo "Some project files were not uploaded to the repo. Re-upload the full zip contents."; exit 1; fi
+
+      - name: Check engines
+        run: ls -la app/src/main/jniLibs/arm64-v8a && file app/src/main/jniLibs/arm64-v8a/*.so
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build APK
+        run: gradle assembleRelease --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EloGrinder-apk
+          path: app/build/outputs/apk/release/*.apk
